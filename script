@@ -1,0 +1,134 @@
+df <- read.csv2("cubagem.csv")
+
+#Ajuste do modelo polinomial de 5° grau #####
+
+#Linear
+modeloln <- "dicc ~ I(dap*(hi/ht))+
+             I(dap*(hi/ht)^2)+
+             I(dap*(hi/ht)^3)+
+             I(dap*(hi/ht)^4)+
+             I(dap*(hi/ht)^5)"
+
+ajlin <- lm(modeloln, df)
+summary(ajlin)
+betas <- coef(ajlin)
+
+#Não-linear
+modelonln <- "dicc ~ dap*(b0 + b1*(hi/ht)+
+  b2*(hi/ht)^2+
+  b3*(hi/ht)^3+
+  b4*(hi/ht)^4+
+  b5*(hi/ht)^5)"
+
+ajnlin <- nls(modelonln, df, start=list(b0=betas[1],
+                                        b1=betas[2],
+                                        b2=betas[3],
+                                        b3=betas[4],
+                                        b4=betas[5],
+                                        b5=betas[6]))
+summary(ajnlin)
+betasnlsc <- coef(ajnlin)
+
+#Árvore e Produtos #####
+dap_euc <- 31.09
+hc_euc <- 31.21
+
+produtos <- data.frame(nome = c(1, 2, 3, 4), 
+                       comprimento = c(2.7, 1.8, 3.0, 1.8),
+                       diametro_min = c(24.4, 15.3, 8.1, 3.1), 
+                       valor = c(27.41, 17.35, 12.18, 6.39))
+
+#Funções #####
+#Polinomial que prevê diametro em determinada altura
+hi <- NA
+pol <- function(hi){
+  dap_euc*(betasnlsc[1] + betasnlsc[2]*(hi/hc_euc) + 
+             betasnlsc[3]*(hi/hc_euc)^2 + betasnlsc[4]*(hi/hc_euc)^3 +
+             betasnlsc[5]*(hi/hc_euc)^4 + betasnlsc[6]*(hi/hc_euc)^5)
+}
+
+# Função para identificar posições possíveis de corte para cada produto
+res <- 0.1  # passo de discretização
+altura_total <- 32.21
+toco <- 0.1
+altura_util <- altura_total - toco
+
+posicoes_validas <- lapply(1:nrow(produtos), function(i) {
+  comp <- produtos$comprimento[i]
+  dmin <- produtos$diametro_min[i]
+  
+  # posições possíveis para início do corte, começando em 0.1
+  posicoes <- seq(toco, altura_util - comp, by = res)
+  
+  # filtra posições onde o diâmetro na base do segmento é suficiente
+  posicoes[sapply(posicoes, function(h) pol(h + comp) >= dmin)]
+})
+
+sapply(posicoes_validas, length)
+posicoes_validas[[1]]
+
+#Otimização #####
+install.packages("ompr")
+install.packages("ompr.roi")
+install.packages("ROI.plugin.glpk")
+install.packages("magrittr")
+install.packages("ROI.plugin.cbc")
+
+library(ompr)
+library(ompr.roi)
+library(ROI.plugin.glpk)
+library(magrittr)
+library(ROI)
+library(ROI.plugin.cbc)
+
+modelo <- MIPModel() %>%
+  add_variable(x[i, j],
+               i = 1:nrow(produtos),
+               j = 1:max(sapply(posicoes_validas, length)),
+               type = "binary")
+
+pontos_corte <- seq(0, hc_euc, by = res)
+
+for (h in pontos_corte) {
+  modelo <- modelo %>%
+    add_constraint(
+      sum_expr(
+        x[i, j],
+        i = 1:nrow(produtos),
+        j = which(
+          (posicoes_validas[[i]] >= h - produtos$comprimento[i]) &
+            (posicoes_validas[[i]] < h)
+        )
+      ) <= 1
+    )
+}
+
+modelo <- modelo %>%
+  set_objective(
+    sum_expr(
+      produtos$valor[i] * x[i, j],
+      i = 1:nrow(produtos),
+      j = 1:length(posicoes_validas[[i]])
+    ),
+    sense = "max"
+  )
+
+resultado <- solve_model(modelo, with_ROI(solver = "glpk"))
+
+solucao <- get_solution(resultado, x[i, j])
+solucao_ativa <- solucao[solucao$value == 1, ]
+
+cortes <- data.frame(
+  produto = produtos$nome[solucao_ativa$i],
+  altura_inicial = mapply(
+    function(i, j) posicoes_validas[[i]][j],
+    solucao_ativa$i, solucao_ativa$j
+  ),
+  comprimento = produtos$comprimento[solucao_ativa$i],
+  valor = produtos$valor[solucao_ativa$i]
+)
+
+cortes$altura_final <- cortes$altura_inicial + cortes$comprimento
+cortes <- cortes[order(cortes$altura_inicial), ]
+
+cortes$total_receita <- sum(cortes$valor)
